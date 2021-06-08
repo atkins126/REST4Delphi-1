@@ -2,23 +2,37 @@
 
 interface
 
-uses System.Rtti, System.SysUtils, System.Types, System.TypInfo, System.Classes, Delphi.Rest.JSON.Serializer.Intf;
+uses System.Rtti, System.SysUtils, System.Types, System.TypInfo, System.Classes, Delphi.Rest.Types, Delphi.Rest.JSON.Serializer.Intf;
 
 type
+  TRestRequest = class
+  public
+    Headers: String;
+    Method: TRESTMethod;
+    Params: String;
+    URL: String;
+  end;
+
   IRestCommunication = interface
     ['{33BB3249-F044-4BDF-B3E0-EA2378A040C4}']
-    function SendRequestSync(const URL: String): String;
-
-    procedure SetHeaders(Headers: TStrings);
+    function SendRequest(const Request: TRestRequest): String;
+    {$IFDEF PAS2JS}
+    function SendRequestAsync(const Request: TRestRequest): String; async;
+    {$ENDIF}
   end;
 
   TRestCommunication = class(TInterfacedObject, IRestCommunication)
   private
-    FHeaders: TStrings;
+    FHeaders: TStringList;
 
-    function SendRequestSync(const URL: String): String;
+    function SendRequest(const Request: TRestRequest): String;
+    {$IFDEF PAS2JS}
+    function SendRequestAsync(const Request: TRestRequest): String; async;
+    {$ENDIF}
+  public
+    constructor Create;
 
-    procedure SetHeaders(Headers: TStrings);
+    destructor Destroy; override;
   end;
 
   TRemoteService = class(TVirtualInterface)
@@ -29,16 +43,20 @@ type
     FSerializer: IRestJsonSerializer;
     FCommunication: IRestCommunication;
     FOnExecuteException: TProc<Exception, IRestJsonSerializer>;
+    FRequest: TRestRequest;
     FHeaders: TStringList;
 
-    function Deserialize(const JSON: String; Method: TRttiMethod): TValue;
-    function FormatURL(Method: TRttiMethod; const Args: TArray<TValue>): String;
+    function Deserialize(const JSON: String; RttiType: TRttiType): TValue;
+    function FormatURL(Method: TRttiMethod): String;
     function GetHeader(Index: String): String;
     function GetHeaders: String;
+    function GetParamsInURL(Method: TRttiMethod): Boolean;
+    function GetComandFromMethod(Method: TRttiMethod): TRESTMethod;
     function GetURLParams(Method: TRttiMethod; const Args: TArray<TValue>): String;
-    function SendRequestSync(Method: TRttiMethod; const Args: TArray<TValue>): String;
+    function SendRequest(Method: TRttiMethod; const Args: TArray<TValue>): String;
 
-    procedure OnInvokeMethodSync(Method: TRttiMethod; const Args: TArray<TValue>; out Result: TValue);
+    procedure LoadRequest(Method: TRttiMethod; const Args: TArray<TValue>);
+    procedure OnInvokeMethod(Method: TRttiMethod; const Args: TArray<TValue>; out Result: TValue);
     procedure SetHeader(Index: String; const Value: String);
     procedure SetHeaders(const Value: String);
 
@@ -47,6 +65,9 @@ type
     function OnInvokeMethodPas2Js(const aMethodName: String; const Args: TJSValueDynArray): JSValue;
     function OnInvokeMethodPas2JsAsync(Method: TRttiMethod; const Args: TArray<TValue>): JSValue; async;
     function OnInvokeMethodPas2JsSync(Method: TRttiMethod; const Args: TArray<TValue>): JSValue;
+    function SendRequestAsync(Method: TRttiMethod; const Args: TArray<TValue>): String; async;
+
+    procedure OnInvokeMethodAsync(Method: TRttiMethod; const Args: TArray<TValue>; out Result: TValue); async;
     {$ENDIF}
   public
     constructor Create(TypeInfo: PTypeInfo);
@@ -111,37 +132,47 @@ uses Delphi.Rest.Exceptions,
 {$ENDIF};
 
 const
+  COMMAND_NAME: array[TRESTMethod] of String = ('DELETE', 'GET', 'PATCH', 'POST', 'PUT');
   COMPILER_OFFSET = 1;
 
 { TRemoteService }
 
 constructor TRemoteService.Create(TypeInfo: PTypeInfo);
 begin
-  inherited Create(TypeInfo, {$IFDEF PAS2JS}@OnInvokeMethodPas2Js{$ELSE}OnInvokeMethodSync{$ENDIF});
+  inherited Create(TypeInfo, {$IFDEF PAS2JS}@OnInvokeMethodPas2Js{$ELSE}OnInvokeMethod{$ENDIF});
 
   FContext := TRttiContext.Create;
   FHeaders := TStringList.Create;
+  FRequest := TRestRequest.Create;
   FRttiType := FContext.GetType(TypeInfo) as TRttiInterfaceType;
 end;
 
-function TRemoteService.Deserialize(const JSON: String; Method: TRttiMethod): TValue;
+function TRemoteService.Deserialize(const JSON: String; RttiType: TRttiType): TValue;
 begin
-  if Assigned(Method.ReturnType) then
-    Result := Serializer.Deserialize(JSON, Method.ReturnType.Handle)
+  if Assigned(RttiType) then
+    Result := Serializer.Deserialize(JSON, RttiType.Handle)
   else
     Result := TValue.Empty;
 end;
 
 destructor TRemoteService.Destroy;
 begin
+  FRequest.Free;
+
   FHeaders.Free;
 
   inherited;
 end;
 
-function TRemoteService.FormatURL(Method: TRttiMethod; const Args: TArray<TValue>): String;
+function TRemoteService.FormatURL(Method: TRttiMethod): String;
 begin
-  Result := Format('%s/%s/%s%s', [FURL, FRttiType.Name.Substring(1), Method.Name, GetURLParams(Method, Args)]);
+  Result := Format('%s/%s/%s', [FURL, FRttiType.Name.Substring(1), Method.Name]);
+end;
+
+function TRemoteService.GetComandFromMethod(Method: TRttiMethod): TRESTMethod;
+begin
+  if not TRESTMethodAttribute.GetMethodType(Method, Result) then
+    Result := rmGet;
 end;
 
 function TRemoteService.GetHeader(Index: String): String;
@@ -152,6 +183,17 @@ end;
 function TRemoteService.GetHeaders: String;
 begin
   Result := FHeaders.Text;
+end;
+
+function TRemoteService.GetParamsInURL(Method: TRttiMethod): Boolean;
+var
+  ParamType: TRESTParamType;
+
+begin
+  if TRESTParamAttribute.GetParamsInURL(Method, ParamType) then
+    Result := ParamType = ptURL
+  else
+    Result := FRequest.Method in [rmGet, rmDelete];
 end;
 
 function TRemoteService.GetURLParams(Method: TRttiMethod; const Args: TArray<TValue>): String;
@@ -171,15 +213,27 @@ begin
 
     Result := Result + Format('%s=%s', [Params[A].Name, Serializer.Serialize(Args[COMPILER_OFFSET + A])]);
   end;
-
-  if not Result.IsEmpty then
-    Result := '?' + Result;
 end;
 
-procedure TRemoteService.OnInvokeMethodSync(Method: TRttiMethod; const Args: TArray<TValue>; out Result: TValue);
+procedure TRemoteService.LoadRequest(Method: TRttiMethod; const Args: TArray<TValue>);
+begin
+  FRequest.Headers := Headers;
+  FRequest.Method := GetComandFromMethod(Method);
+  FRequest.Params := GetURLParams(Method, Args);
+  FRequest.URL := FormatURL(Method);
+
+  if GetParamsInURL(Method) and not FRequest.Params.IsEmpty then
+  begin
+    FRequest.URL := FRequest.URL + '?' + FRequest.Params;
+
+    FRequest.Params := EmptyStr;
+  end;
+end;
+
+procedure TRemoteService.OnInvokeMethod(Method: TRttiMethod; const Args: TArray<TValue>; out Result: TValue);
 begin
   try
-    Result := Deserialize(SendRequestSync(Method, Args), Method);
+    Result := Deserialize(SendRequest(Method, Args), Method.ReturnType);
   except
     on E: Exception do
       if Assigned(FOnExecuteException) then
@@ -189,11 +243,11 @@ begin
   end;
 end;
 
-function TRemoteService.SendRequestSync(Method: TRttiMethod; const Args: TArray<TValue>): String;
+function TRemoteService.SendRequest(Method: TRttiMethod; const Args: TArray<TValue>): String;
 begin
-  Communication.SetHeaders(FHeaders);
+  LoadRequest(Method, Args);
 
-  Result := Communication.SendRequestSync(FormatURL(Method, Args));
+  Result := Communication.SendRequest(FRequest);
 end;
 
 procedure TRemoteService.SetHeader(Index: String; const Value: String);
@@ -234,23 +288,9 @@ begin
   Method := FRttiType.GetMethod(aMethodName);
 
   if Method.IsAsyncCall then
-    Result := TJSPromise.New(
-      procedure(Resolve, Reject: TJSPromiseResolver)
-      begin
-        Resolve(OnInvokeMethodPas2JsAsync(Method, GenerateParams(Method, Args)));
-      end)
+    Result := OnInvokeMethodPas2JsAsync(Method, GenerateParams(Method, Args))
   else
     Result := OnInvokeMethodPas2JsSync(Method, GenerateParams(Method, Args));
-end;
-
-function TRemoteService.OnInvokeMethodPas2JsSync(Method: TRttiMethod; const Args: TArray<TValue>): JSValue;
-var
-  Return: TValue;
-
-begin
-  OnInvokeMethodSync(Method, Args, Return);
-
-  Result := Return.AsJSValue;
 end;
 
 function TRemoteService.OnInvokeMethodPas2JsAsync(Method: TRttiMethod; const Args: TArray<TValue>): JSValue;
@@ -258,15 +298,68 @@ var
   Return: TValue;
 
 begin
-  OnInvokeMethodSync(Method, Args, Return);
+  await(OnInvokeMethodAsync(Method, Args, Return));
 
   Result := Return.AsJSValue;
 end;
+
+function TRemoteService.OnInvokeMethodPas2JsSync(Method: TRttiMethod; const Args: TArray<TValue>): JSValue;
+var
+  Return: TValue;
+
+begin
+  OnInvokeMethod(Method, Args, Return);
+
+  Result := Return.AsJSValue;
+end;
+
+procedure TRemoteService.OnInvokeMethodAsync(Method: TRttiMethod; const Args: TArray<TValue>; out Result: TValue);
+var
+  ReturnType: TRttiType;
+
+begin
+  try
+    ReturnType := Method.ReturnType;
+
+    if Assigned(ReturnType) and ReturnType.IsInstanceExternal and (ReturnType.AsInstanceExternal.ExternalName = 'Promise') then
+      ReturnType := nil;
+
+    Result := Deserialize(await(SendRequestAsync(Method, Args)), ReturnType);
+  except
+    on E: Exception do
+      if Assigned(FOnExecuteException) then
+        OnExecuteException(E, Serializer)
+      else
+        raise;
+  end;
+end;
+
+function TRemoteService.SendRequestAsync(Method: TRttiMethod; const Args: TArray<TValue>): String;
+begin
+  LoadRequest(Method, Args);
+
+  Result := await(Communication.SendRequestAsync(FRequest));
+end;
+
 {$ENDIF}
 
 { TRestCommunication }
 
-function TRestCommunication.SendRequestSync(const URL: String): String;
+constructor TRestCommunication.Create;
+begin
+  inherited;
+
+  FHeaders := TStringList.Create;
+end;
+
+destructor TRestCommunication.Destroy;
+begin
+  FHeaders.Free;
+
+  inherited;
+end;
+
+function TRestCommunication.SendRequest(const Request: TRestRequest): String;
 {$IFDEF PAS2JS}
 var
   Connection: TJSXMLHttpRequest;
@@ -275,15 +368,20 @@ var
 
 {$ENDIF}
 begin
+  FHeaders.Text := Request.Headers;
+
 {$IFDEF PAS2JS}
   Connection := TJSXMLHttpRequest.New;
 
-  Connection.Open('GET', URL, False);
+  Connection.Open(COMMAND_NAME[Request.Method], Request.URL, False);
 
   for A := 0 to Pred(FHeaders.Count) do
     Connection.setRequestHeader(FHeaders.Names[A], FHeaders.ValueFromIndex[A]);
 
-  Connection.Send;
+  if not Request.Params.IsEmpty then
+    Connection.setRequestHeader('Content-Type', 'application/json');
+
+  Connection.Send(Request.Params);
 
   if Connection.Status = 200 then
     Result := Connection.ResponseText
@@ -293,7 +391,18 @@ begin
   var Connection := THTTPClient.Create;
 
   try
-    var Response := Connection.Get(URL);
+    var Response: IHTTPResponse;
+
+    for var A := 0 to Pred(FHeaders.Count) do
+      Connection.CustomHeaders[FHeaders.Names[A]] := FHeaders.ValueFromIndex[A];
+
+    case Request.Method of
+      rmDelete: Response := Connection.Delete(Request.URL);
+      rmGet: Response := Connection.Get(Request.URL);
+      rmPatch: Response := Connection.Patch(Request.URL);
+      rmPost: Response := Connection.Post(Request.URL, TStream(nil));
+      rmPut: Response := Connection.Put(Request.URL);
+    end;
 
     var Content := Response.ContentAsString(TEncoding.UTF8);
 
@@ -307,10 +416,43 @@ begin
 {$ENDIF}
 end;
 
-procedure TRestCommunication.SetHeaders(Headers: TStrings);
+{$IFDEF PAS2JS}
+function TRestCommunication.SendRequestAsync(const Request: TRestRequest): String;
+var
+  A: Integer;
+
+  Options: TJSObject;
+
+  RequestHeaders: TJSHTMLHeaders;
+
+  Response: TJSResponse;
+
 begin
-  FHeaders := Headers;
+  FHeaders.Text := Request.Headers;
+  Options := TJSObject.New;
+  RequestHeaders := TJSHTMLHeaders.New;
+
+  for A := 0 to Pred(FHeaders.Count) do
+    RequestHeaders.Append(FHeaders.Names[A], FHeaders.ValueFromIndex[A]);
+
+  if not Request.Params.IsEmpty then
+  begin
+    Options['body'] := Request.Params;
+
+    RequestHeaders.Append('Content-Type', 'application/json');
+  end;
+
+  Options['headers'] := RequestHeaders;
+  Options['method'] := COMMAND_NAME[Request.Method];
+
+  Response := await(Window.Fetch(Request.URL, Options));
+
+  if Response.Status = 200 then
+    Result := await(Response.Text)
+  else
+    raise EHTTPStatusError.Create(Response.Status, await(Response.Text));
 end;
+{$ENDIF}
 
 { TRemoteServiceTyped<T> }
 
